@@ -3,7 +3,7 @@ import random
 import asyncio
 import time
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 from concurrent.futures import ThreadPoolExecutor
 
 # Большой пул User-Agent'ов для ротации
@@ -34,14 +34,18 @@ def get_session():
 
 
 def extract_query_from_url(url: str) -> str | None:
-    """Извлекает поисковый запрос из ссылки WB поиска."""
+    """Извлекает поисковый запрос из ссылки WB поиска.
+    Поддерживает как обычные, так и процентно-закодированные URL.
+    """
     try:
-        parsed = urlparse(url)
+        # Декодируем URL если он закодирован дважды
+        decoded_url = unquote(url)
+        parsed = urlparse(decoded_url)
         params = parse_qs(parsed.query)
         # Поддерживаем оба варианта параметра
         query = params.get("search") or params.get("query")
         if query:
-            return query[0]
+            return unquote(query[0])
     except Exception:
         pass
     return None
@@ -60,9 +64,8 @@ def extract_article_from_url(url: str) -> str | None:
 
 
 def search_wb(query: str) -> list[dict]:
-    """Поиск товаров по запросу через WB API."""
-    session = get_session()
-    url = "https://search.wb.ru/exactmatch/ru/common/v4/search"
+    """Поиск товаров по запросу через WB API. До 3 попыток с задержкой при 429."""
+    url = "https://search.wb.ru/exactmatch/ru/common/v5/search"
 
     params = {
         "appType": 1,
@@ -72,33 +75,46 @@ def search_wb(query: str) -> list[dict]:
         "resultset": "catalog",
         "sort": "popular",
         "spp": 30,
+        "suppressSpellcheck": "false",
+        "lang": "ru",
     }
 
-    # Случайная задержка для снижения нагрузки и вероятности блокировки
-    time.sleep(random.uniform(0.3, 1.2))
+    for attempt in range(3):
+        # Задержка растёт с каждой попыткой: 1-2с, 3-5с, 6-10с
+        delay = random.uniform(1.0 + attempt * 2, 2.0 + attempt * 4)
+        time.sleep(delay)
 
-    try:
-        r = session.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        products = data.get("data", {}).get("products", [])
+        session = get_session()
+        try:
+            r = session.get(url, params=params, timeout=15)
 
-        out = []
-        for p in products[:5]:
-            price_raw = p.get("salePriceU") or p.get("priceU") or 0
-            price = price_raw // 100
-            article_id = p.get("id", "")
-            out.append({
-                "query": query,
-                "name": p.get("name", "—"),
-                "brand": p.get("brand", "—"),
-                "price": price,
-                "url": f"https://www.wildberries.ru/catalog/{article_id}/detail.aspx"
-            })
-        return out
-    except Exception as e:
-        print(f"[search_wb] Ошибка для запроса '{query}': {e}")
-        return []
+            if r.status_code == 429:
+                print(f"[search_wb] 429 для '{query}', попытка {attempt + 1}/3, жду {delay:.1f}с...")
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+            products = data.get("data", {}).get("products", [])
+
+            out = []
+            for p in products[:5]:
+                price_raw = p.get("salePriceU") or p.get("priceU") or 0
+                price = price_raw // 100
+                article_id = p.get("id", "")
+                out.append({
+                    "query": query,
+                    "name": p.get("name", "—"),
+                    "brand": p.get("brand", "—"),
+                    "price": price,
+                    "url": f"https://www.wildberries.ru/catalog/{article_id}/detail.aspx"
+                })
+            return out
+
+        except Exception as e:
+            print(f"[search_wb] Ошибка для '{query}' (попытка {attempt + 1}/3): {e}")
+
+    print(f"[search_wb] Все попытки исчерпаны для '{query}'")
+    return []
 
 
 def get_product_by_article(article: str, original_url: str) -> list[dict]:
@@ -226,7 +242,7 @@ def process_line(line: str) -> list[dict]:
 async def process_queries(queries: list[str]) -> list[dict]:
     """Параллельно обрабатывает все строки из файла."""
     loop = asyncio.get_event_loop()
-    executor = ThreadPoolExecutor(max_workers=10)  # 10 потоков — баланс скорости и вежливости
+    executor = ThreadPoolExecutor(max_workers=3)  # 3 потока — WB не банит
 
     tasks = [
         loop.run_in_executor(executor, process_line, q)
